@@ -9,13 +9,14 @@ const fs = require('fs').promises;
 const RedisCache = require('../utils/redisCache');
 
 // --- Configuration ---
+// Debug logging flag - set DEBUG=true to enable verbose logging
 const DEBUG = process.env.DEBUG === 'true' || process.env['4KHDHUB_DEBUG'] === 'true';
 const CACHE_ENABLED = process.env.DISABLE_CACHE !== 'true';
 const CACHE_DIR = process.env.VERCEL ? path.join('/tmp', '.4khdhub_cache') : path.join(__dirname, '.cache', '4khdhub');
 const BASE_URL = 'https://4khdhub.fans';
 const TMDB_API_KEY = '439c478a771f35c05022f9feabcca01c';
 const MAX_RETRIES = 3;
-const CONCURRENCY_LIMIT = 5; // Process 5 links at a time
+const CONCURRENCY_LIMIT = 5; // How many links to process at once
 
 // Logger
 const log = DEBUG ? console.log : () => { };
@@ -35,9 +36,9 @@ const ensureCacheDir = async () => {
 ensureCacheDir();
 
 // --- HTTP Client Setup ---
-// Create a specialized Axios instance with better default headers
+// Create a specialized Axios instance with browser-like headers
 const client = axios.create({
-    timeout: 15000, // Increased timeout
+    timeout: 15000,
     headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
@@ -57,7 +58,7 @@ const atob = (str) => Buffer.from(str, 'base64').toString('binary');
 // --- Helper Functions ---
 
 /**
- * Robust fetch with retry logic
+ * Robust fetch with retry logic and exponential backoff
  */
 async function fetchText(url, options = {}) {
     let lastError;
@@ -70,8 +71,8 @@ async function fetchText(url, options = {}) {
             return response.data;
         } catch (error) {
             lastError = error;
-            logWarn(`[4KHDHub] Attempt ${i + 1}/${MAX_RETRIES} failed for ${url}: ${error.message}`);
-            // Wait before retrying (exponential backoff: 1s, 2s, 4s)
+            if (DEBUG) logWarn(`[4KHDHub] Attempt ${i + 1}/${MAX_RETRIES} failed for ${url}: ${error.message}`);
+            // Wait before retrying (1s, 2s, 4s)
             await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, i)));
         }
     }
@@ -109,7 +110,7 @@ async function getTmdbDetails(tmdbId, type) {
 // --- Scraper Logic ---
 
 async function fetchPageUrl(name, year, isSeries) {
-    const cacheKey = `search_v3_${name.replace(/[^a-z0-9]/gi, '_')}_${year}`; // Bumped version to v3
+    const cacheKey = `search_v3_${name.replace(/[^a-z0-9]/gi, '_')}_${year}`;
     
     if (CACHE_ENABLED) {
         const cached = await redisCache.getFromCache(cacheKey, '', CACHE_DIR);
@@ -160,46 +161,59 @@ async function fetchPageUrl(name, year, isSeries) {
     return result;
 }
 
+/**
+ * Robust Redirect Resolver
+ * Handles encryption layers (atob, rot13) and meta-refreshes
+ */
 async function resolveRedirectUrl(redirectUrl) {
-    const cacheKey = `redirect_v3_${redirectUrl.replace(/[^a-z0-9]/gi, '')}`;
+    const cacheKey = `redirect_v4_${redirectUrl.replace(/[^a-z0-9]/gi, '')}`;
     if (CACHE_ENABLED) {
         const cached = await redisCache.getFromCache(cacheKey, '', CACHE_DIR);
         if (cached) return cached.data || cached;
     }
 
-    const redirectHtml = await fetchText(redirectUrl);
-    if (!redirectHtml) return null;
+    const html = await fetchText(redirectUrl);
+    if (!html) return null;
 
-    try {
-        // Robust Regex: Handles various spacing around 'o' and the value
-        const redirectDataMatch = redirectHtml.match(/'o'\s*,\s*['"](.*?)['"]/);
-        
-        if (!redirectDataMatch) {
-            logWarn(`[4KHDHub] Failed to match redirect data pattern for ${redirectUrl}`);
-            return null;
-        }
+    let resolvedUrl = null;
 
-        // Logic: atob -> atob -> rot13 -> atob -> JSON
-        const step1 = atob(redirectDataMatch[1]);
-        const step2 = atob(step1);
-        const step3 = rot13Cipher(step2);
-        const step4 = atob(step3);
-        const redirectData = JSON.parse(step4);
-
-        if (redirectData && redirectData.o) {
-            const resolved = atob(redirectData.o);
-            if (CACHE_ENABLED) {
-                await redisCache.saveToCache(cacheKey, { data: resolved }, '', CACHE_DIR, 86400 * 3); // 3 days
+    // STRATEGY A: Standard "Hub" Obfuscation (var o = '...')
+    const match = html.match(/['"]o['"]\s*,\s*['"](.*?)['"]/);
+    if (match) {
+        try {
+            // Standard chain: Atob -> Atob -> Rot13 -> Atob -> JSON
+            let step = atob(match[1]); 
+            step = atob(step);        
+            step = rot13Cipher(step); 
+            step = atob(step);        
+            const json = JSON.parse(step);
+            if (json && json.o) {
+                resolvedUrl = atob(json.o);
             }
-            return resolved;
+        } catch (e) {
+            logWarn(`[4KHDHub] Decode error: ${e.message}`);
         }
-    } catch (e) {
-        console.error(`[4KHDHub] Error resolving redirect obfuscation: ${e.message}`);
     }
+
+    // STRATEGY B: Meta Refresh (Fallback)
+    if (!resolvedUrl) {
+        const metaMatch = html.match(/content=['"]\d+;\s*url=(.*?)['"]/i);
+        if (metaMatch) resolvedUrl = metaMatch[1];
+    }
+
+    if (resolvedUrl) {
+        if (CACHE_ENABLED) {
+            await redisCache.saveToCache(cacheKey, { data: resolvedUrl }, '', CACHE_DIR, 86400 * 3); // 3 days
+        }
+        return resolvedUrl;
+    }
+
     return null;
 }
 
-// Logic to extract the specific HubCloud/Drive link from the row
+/**
+ * Extracts the source info (Quality, Size, Initial URL) from the movie page listing
+ */
 async function extractSourceResults($, el) {
     const localHtml = $(el).html();
     const sizeMatch = localHtml.match(/([\d.]+ ?[GM]B)/i);
@@ -212,13 +226,12 @@ async function extractSourceResults($, el) {
         heightMatch = title.match(/(\d{3,4})p/i);
     }
 
-    // Fallback for "4K"
+    // Fallback for "4K" text without specific "2160p" text
     let height = heightMatch ? parseInt(heightMatch[0]) : 0;
     if (height === 0) {
         if (title.match(/4K|2160p/i) || localHtml.match(/4K|2160p/i)) height = 2160;
         else if (title.match(/1080p/i) || localHtml.match(/1080p/i)) height = 1080;
         else if (title.match(/720p/i) || localHtml.match(/720p/i)) height = 720;
-        else if (title.match(/480p/i) || localHtml.match(/480p/i)) height = 480;
     }
 
     const meta = {
@@ -245,11 +258,10 @@ async function extractSourceResults($, el) {
     if (hubDriveLink) {
         const resolvedDrive = await resolveRedirectUrl(hubDriveLink);
         if (resolvedDrive) {
-            // We must fetch the HubDrive page to find the HubCloud link
+            // Fetch HubDrive page to find inner HubCloud link
             const hubDriveHtml = await fetchText(resolvedDrive);
             if (hubDriveHtml) {
                 const $2 = cheerio.load(hubDriveHtml);
-                // Look for the inner Cloud link
                 const innerCloudLink = $2('a').filter((i, el) => $(el).text().includes('HubCloud')).attr('href');
                 if (innerCloudLink) {
                     return { url: innerCloudLink, meta, type: 'drive' };
@@ -261,47 +273,50 @@ async function extractSourceResults($, el) {
     return null;
 }
 
-// HubCloud Extractor Logic
+/**
+ * Aggressive Extractor for HubCloud final pages
+ */
 async function extractHubCloud(hubCloudUrl, baseMeta) {
     if (!hubCloudUrl) return [];
 
-    const cacheKey = `hubcloud_v3_${hubCloudUrl.replace(/[^a-z0-9]/gi, '')}`;
+    const cacheKey = `hubcloud_v4_${hubCloudUrl.replace(/[^a-z0-9]/gi, '')}`;
     if (CACHE_ENABLED) {
         const cached = await redisCache.getFromCache(cacheKey, '', CACHE_DIR);
         if (cached) return cached.data || cached;
     }
 
-    // Important: Pass the correct Referer
-    const headers = { Referer: hubCloudUrl };
-    
+    // IMPORTANT: Referer must be the hubCloudUrl itself usually
+    const headers = { Referer: hubCloudUrl }; 
+
     // Step 1: Fetch the interstitial page
     const redirectHtml = await fetchText(hubCloudUrl, { headers });
     if (!redirectHtml) return [];
 
     // Step 2: Extract the destination URL
-    // IMPROVED REGEX: Handles single/double quotes and whitespace variations
-    const redirectUrlMatch = redirectHtml.match(/var\s+url\s*=\s*['"]([^'"]+)['"]/i);
+    // REGEX: Handles "var url", "var link", single/double quotes
+    const redirectUrlMatch = redirectHtml.match(/var\s+(?:url|link)\s*=\s*['"]([^'"]+)['"]/i);
     
-    if (!redirectUrlMatch) {
-        logWarn(`[4KHDHub] Could not find 'var url' in HubCloud response for ${hubCloudUrl}`);
-        // Fallback: Check for meta refresh just in case
-        const metaRefresh = redirectHtml.match(/content=['"]\d+;url=([^'"]+)['"]/i);
-        if (metaRefresh) {
-            log(`[4KHDHub] Found meta refresh fallback.`);
-             // proceed with metaRefresh[1] if implemented, but usually it's the JS var
-        }
+    let finalLinksUrl = null;
+    if (redirectUrlMatch) {
+        finalLinksUrl = redirectUrlMatch[1];
+    } else {
+        // Fallback: Check for meta refresh
+        const metaRefresh = redirectHtml.match(/content=['"]\d+;\s*url=([^'"]+)['"]/i);
+        if (metaRefresh) finalLinksUrl = metaRefresh[1];
+    }
+
+    if (!finalLinksUrl) {
+        if(DEBUG) logWarn(`[4KHDHub] Failed to find next URL in HubCloud page: ${hubCloudUrl}`);
         return [];
     }
 
-    const finalLinksUrl = redirectUrlMatch[1];
-    
     // Step 3: Fetch the final links page
     const linksHtml = await fetchText(finalLinksUrl, { headers });
     if (!linksHtml) return [];
 
     const $ = cheerio.load(linksHtml);
     const results = [];
-    const sizeText = $('#size').text(); // Try to get size from final page
+    const sizeText = $('#size, .file-size').text().trim();
     const titleText = $('title').text().replace(' - HubCloud', '').trim();
 
     const currentMeta = {
@@ -313,37 +328,40 @@ async function extractHubCloud(hubCloudUrl, baseMeta) {
     // Helper to clean PixelServer URLs
     const cleanPixelUrl = (u) => u.replace('/u/', '/api/file/');
 
+    // Step 4: Scan ALL links
     $('a').each((_i, el) => {
-        const text = $(el).text().trim();
+        const text = $(el).text().trim().toLowerCase();
         const href = $(el).attr('href');
-        if (!href || href === '#') return;
+        const classes = $(el).attr('class') || '';
 
-        // Condition 1: FSL / Download File
-        if (text.includes('FSL') || text.includes('Download File')) {
-             results.push({
+        if (!href || href === '#' || href.startsWith('javascript')) return;
+
+        // MATCHING LOGIC
+        const isFSL = text.includes('fsl') || text.includes('download file');
+        const isPixel = text.includes('pixel') || text.includes('fast server');
+        // Sometimes valid links are just generic "Download" buttons
+        const isGenericDownload = classes.includes('btn-success') || classes.includes('btn-primary');
+
+        if (isFSL) {
+            results.push({
                 source: 'FSL',
                 url: href,
                 meta: currentMeta
             });
         }
-        // Condition 2: PixelServer / Fast Server
-        else if (text.includes('PixelServer') || text.includes('Fast Server')) {
+        else if (isPixel) {
             results.push({
                 source: 'PixelServer',
                 url: cleanPixelUrl(href),
                 meta: currentMeta
             });
         }
-        // Condition 3: Instant / Direct (Common variations)
-        else if (text.includes('Instant') || $(el).attr('class')?.includes('btn-success')) {
-             // Sometimes generic success buttons are the download links
-             if (!results.find(r => r.url === href)) {
-                 results.push({
-                    source: 'Direct',
-                    url: href,
-                    meta: currentMeta
-                 });
-             }
+        else if (isGenericDownload && !results.some(r => r.url === href)) {
+             results.push({
+                source: 'Direct',
+                url: href,
+                meta: currentMeta
+            });
         }
     });
 
@@ -400,14 +418,13 @@ async function get4KHDHubStreams(tmdbId, type, season = null, episode = null) {
     log(`[4KHDHub] Found ${itemsToProcess.length} potential sources. Processing...`);
 
     // --- CONCURRENCY HANDLING ---
-    // Simple implementation of p-limit to avoid banning
-    // We map the items to promises that execute the extraction logic
+    // Process multiple links in parallel to speed up scraping
     
-    const streams = [];
-    let activePromises = 0;
     const results = [];
+    const queue = [...itemsToProcess];
+    const workers = [];
 
-    // Helper to process a single item
+    // Worker function
     const processItem = async (item) => {
         try {
             const sourceResult = await extractSourceResults($, item);
@@ -423,7 +440,6 @@ async function get4KHDHubStreams(tmdbId, type, season = null, episode = null) {
                         quality: sourceResult.meta.height ? `${sourceResult.meta.height}p` : undefined,
                         behaviorHints: {
                             bingeGroup: `4khdhub-${link.source}`,
-                            // headers: { ... } // If the video file needs headers, add them here
                         }
                     });
                 });
@@ -433,10 +449,8 @@ async function get4KHDHubStreams(tmdbId, type, season = null, episode = null) {
         }
     };
 
-    // Execution Queue
-    const queue = [...itemsToProcess];
+    // Run queue with concurrency limit
     const runQueue = async () => {
-        const workers = [];
         while (queue.length > 0) {
             if (workers.length >= CONCURRENCY_LIMIT) {
                 await Promise.race(workers);
