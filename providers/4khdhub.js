@@ -8,48 +8,75 @@ const path = require('path');
 const fs = require('fs').promises;
 const RedisCache = require('../utils/redisCache');
 
-// Debug logging flag - set DEBUG=true to enable verbose logging
+// --- Configuration ---
 const DEBUG = process.env.DEBUG === 'true' || process.env['4KHDHUB_DEBUG'] === 'true';
+const CACHE_ENABLED = process.env.DISABLE_CACHE !== 'true';
+const CACHE_DIR = process.env.VERCEL ? path.join('/tmp', '.4khdhub_cache') : path.join(__dirname, '.cache', '4khdhub');
+const BASE_URL = 'https://4khdhub.fans';
+const TMDB_API_KEY = '439c478a771f35c05022f9feabcca01c';
+const MAX_RETRIES = 3;
+const CONCURRENCY_LIMIT = 5; // Process 5 links at a time
+
+// Logger
 const log = DEBUG ? console.log : () => { };
 const logWarn = DEBUG ? console.warn : () => { };
 
-// Cache configuration
-const CACHE_ENABLED = process.env.DISABLE_CACHE !== 'true';
-const CACHE_DIR = process.env.VERCEL ? path.join('/tmp', '.4khdhub_cache') : path.join(__dirname, '.cache', '4khdhub');
 const redisCache = new RedisCache('4KHDHub');
 
-// Helper to ensure cache directory exists
+// Ensure cache directory exists
 const ensureCacheDir = async () => {
     if (!CACHE_ENABLED) return;
     try {
         await fs.mkdir(CACHE_DIR, { recursive: true });
     } catch (error) {
-        console.error(`[4KHDHub] Error creating cache directory: ${error.message}`);
+        if (error.code !== 'EEXIST') console.error(`[4KHDHub] Error creating cache directory: ${error.message}`);
     }
 };
 ensureCacheDir();
 
-const BASE_URL = 'https://4khdhub.fans';
-const TMDB_API_KEY = '439c478a771f35c05022f9feabcca01c';
+// --- HTTP Client Setup ---
+// Create a specialized Axios instance with better default headers
+const client = axios.create({
+    timeout: 15000, // Increased timeout
+    headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-User': '?1'
+    }
+});
 
-// Polyfill for atob if not available globally
+// Polyfill for atob
 const atob = (str) => Buffer.from(str, 'base64').toString('binary');
 
-// Helper to fetch text content
+// --- Helper Functions ---
+
+/**
+ * Robust fetch with retry logic
+ */
 async function fetchText(url, options = {}) {
-    try {
-        const response = await axios.get(url, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                ...options.headers
-            },
-            timeout: 10000
-        });
-        return response.data;
-    } catch (error) {
-        console.error(`[4KHDHub] Request failed for ${url}: ${error.message}`);
-        return null;
+    let lastError;
+    for (let i = 0; i < MAX_RETRIES; i++) {
+        try {
+            const response = await client.get(url, {
+                ...options,
+                validateStatus: (status) => status >= 200 && status < 500
+            });
+            return response.data;
+        } catch (error) {
+            lastError = error;
+            logWarn(`[4KHDHub] Attempt ${i + 1}/${MAX_RETRIES} failed for ${url}: ${error.message}`);
+            // Wait before retrying (exponential backoff: 1s, 2s, 4s)
+            await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, i)));
+        }
     }
+    console.error(`[4KHDHub] FATAL: Request failed after ${MAX_RETRIES} attempts for ${url}: ${lastError?.message}`);
+    return null;
 }
 
 // Fetch TMDB Details
@@ -58,9 +85,9 @@ async function getTmdbDetails(tmdbId, type) {
         const isSeries = type === 'series' || type === 'tv';
         const url = `https://api.themoviedb.org/3/${isSeries ? 'tv' : 'movie'}/${tmdbId}?api_key=${TMDB_API_KEY}`;
         log(`[4KHDHub] Fetching TMDB details from: ${url}`);
+        
         const response = await axios.get(url);
         const data = response.data;
-        // ...
 
         if (isSeries) {
             return {
@@ -79,19 +106,14 @@ async function getTmdbDetails(tmdbId, type) {
     }
 }
 
-// FourKHDHub Logic
-async function fetchPageUrl(name, year, isSeries) {
-    const cacheKey = `search_v2_${name.replace(/[^a-z0-9]/gi, '_')}_${year}`;
-    // [4KHDHub] Checking cache for key: ${cacheKey} (Enabled: ${CACHE_ENABLED})
+// --- Scraper Logic ---
 
+async function fetchPageUrl(name, year, isSeries) {
+    const cacheKey = `search_v3_${name.replace(/[^a-z0-9]/gi, '_')}_${year}`; // Bumped version to v3
+    
     if (CACHE_ENABLED) {
         const cached = await redisCache.getFromCache(cacheKey, '', CACHE_DIR);
-        if (cached) {
-            // [4KHDHub] Cache HIT for search: ${name}
-            return cached.data || cached;
-        } else {
-            // [4KHDHub] Cache MISS for search: ${name}
-        }
+        if (cached) return cached.data || cached;
     }
 
     const searchUrl = `${BASE_URL}/?s=${encodeURIComponent(`${name} ${year}`)}`;
@@ -110,6 +132,7 @@ async function fetchPageUrl(name, year, isSeries) {
         .filter((_i, el) => {
             const metaText = $(el).find('.movie-card-meta').text();
             const movieCardYear = parseInt(metaText);
+            // Allow 1 year margin of error
             return !isNaN(movieCardYear) && Math.abs(movieCardYear - year) <= 1;
         })
         .filter((_i, el) => {
@@ -117,9 +140,8 @@ async function fetchPageUrl(name, year, isSeries) {
                 .text()
                 .replace(/\[.*?]/g, '')
                 .trim();
-
+            
             // Allow exact match or close Levenshtein distance
-            // Also user's code used: useCollator: true, but fast-levenshtein is simpler
             return levenshtein.get(movieCardTitle.toLowerCase(), name.toLowerCase()) < 5;
         })
         .map((_i, el) => {
@@ -139,7 +161,7 @@ async function fetchPageUrl(name, year, isSeries) {
 }
 
 async function resolveRedirectUrl(redirectUrl) {
-    const cacheKey = `redirect_v2_${redirectUrl.replace(/[^a-z0-9]/gi, '')}`;
+    const cacheKey = `redirect_v3_${redirectUrl.replace(/[^a-z0-9]/gi, '')}`;
     if (CACHE_ENABLED) {
         const cached = await redisCache.getFromCache(cacheKey, '', CACHE_DIR);
         if (cached) return cached.data || cached;
@@ -149,10 +171,15 @@ async function resolveRedirectUrl(redirectUrl) {
     if (!redirectHtml) return null;
 
     try {
-        const redirectDataMatch = redirectHtml.match(/'o','(.*?)'/);
-        if (!redirectDataMatch) return null;
+        // Robust Regex: Handles various spacing around 'o' and the value
+        const redirectDataMatch = redirectHtml.match(/'o'\s*,\s*['"](.*?)['"]/);
+        
+        if (!redirectDataMatch) {
+            logWarn(`[4KHDHub] Failed to match redirect data pattern for ${redirectUrl}`);
+            return null;
+        }
 
-        // JSON.parse(atob(rot13Cipher(atob(atob(redirectDataMatch[1] as string)))))
+        // Logic: atob -> atob -> rot13 -> atob -> JSON
         const step1 = atob(redirectDataMatch[1]);
         const step2 = atob(step1);
         const step3 = rot13Cipher(step2);
@@ -167,15 +194,16 @@ async function resolveRedirectUrl(redirectUrl) {
             return resolved;
         }
     } catch (e) {
-        console.error(`[4KHDHub] Error resolving redirect: ${e.message}`);
+        console.error(`[4KHDHub] Error resolving redirect obfuscation: ${e.message}`);
     }
     return null;
 }
 
+// Logic to extract the specific HubCloud/Drive link from the row
 async function extractSourceResults($, el) {
     const localHtml = $(el).html();
-    const sizeMatch = localHtml.match(/([\d.]+ ?[GM]B)/);
-    let heightMatch = localHtml.match(/\d{3,}p/);
+    const sizeMatch = localHtml.match(/([\d.]+ ?[GM]B)/i);
+    let heightMatch = localHtml.match(/\d{3,4}p/i);
 
     const title = $(el).find('.file-title, .episode-file-title').text().trim();
 
@@ -186,8 +214,11 @@ async function extractSourceResults($, el) {
 
     // Fallback for "4K"
     let height = heightMatch ? parseInt(heightMatch[0]) : 0;
-    if (height === 0 && (title.includes('4K') || title.includes('4k') || localHtml.includes('4K') || localHtml.includes('4k'))) {
-        height = 2160;
+    if (height === 0) {
+        if (title.match(/4K|2160p/i) || localHtml.match(/4K|2160p/i)) height = 2160;
+        else if (title.match(/1080p/i) || localHtml.match(/1080p/i)) height = 1080;
+        else if (title.match(/720p/i) || localHtml.match(/720p/i)) height = 720;
+        else if (title.match(/480p/i) || localHtml.match(/480p/i)) height = 480;
     }
 
     const meta = {
@@ -196,17 +227,17 @@ async function extractSourceResults($, el) {
         title: title
     };
 
-    // Check for HubCloud link
+    // 1. Try HubCloud Link directly
     let hubCloudLink = $(el).find('a')
         .filter((_i, a) => $(a).text().includes('HubCloud'))
         .attr('href');
 
     if (hubCloudLink) {
         const resolved = await resolveRedirectUrl(hubCloudLink);
-        return { url: resolved, meta };
+        return { url: resolved, meta, type: 'cloud' };
     }
 
-    // Check for HubDrive link
+    // 2. Try HubDrive Link (which usually contains a HubCloud link inside)
     let hubDriveLink = $(el).find('a')
         .filter((_i, a) => $(a).text().includes('HubDrive'))
         .attr('href');
@@ -214,12 +245,14 @@ async function extractSourceResults($, el) {
     if (hubDriveLink) {
         const resolvedDrive = await resolveRedirectUrl(hubDriveLink);
         if (resolvedDrive) {
+            // We must fetch the HubDrive page to find the HubCloud link
             const hubDriveHtml = await fetchText(resolvedDrive);
             if (hubDriveHtml) {
                 const $2 = cheerio.load(hubDriveHtml);
-                const innerCloudLink = $2('a:contains("HubCloud")').attr('href');
+                // Look for the inner Cloud link
+                const innerCloudLink = $2('a').filter((i, el) => $(el).text().includes('HubCloud')).attr('href');
                 if (innerCloudLink) {
-                    return { url: innerCloudLink, meta };
+                    return { url: innerCloudLink, meta, type: 'drive' };
                 }
             }
         }
@@ -232,70 +265,96 @@ async function extractSourceResults($, el) {
 async function extractHubCloud(hubCloudUrl, baseMeta) {
     if (!hubCloudUrl) return [];
 
-    const cacheKey = `hubcloud_v2_${hubCloudUrl.replace(/[^a-z0-9]/gi, '')}`;
+    const cacheKey = `hubcloud_v3_${hubCloudUrl.replace(/[^a-z0-9]/gi, '')}`;
     if (CACHE_ENABLED) {
         const cached = await redisCache.getFromCache(cacheKey, '', CACHE_DIR);
         if (cached) return cached.data || cached;
     }
 
-    const headers = { Referer: hubCloudUrl }; // or should it be the previous page? User's code uses meta.referer ?? url.href. HubCloud.ts says Referer: meta.referer ?? url.href.
-    // In extractInternal(ctx, url, meta): const headers = { Referer: meta.referer ?? url.href };
-    // Then fetches redirectHtml.
-
-    // We'll trust the url itself as referer if we don't have the parent page readily passed down, or just no referer.
-    // Let's use the HubCloud URL itself as referer for the first request, that's usually safe or standard.
-
-    const redirectHtml = await fetchText(hubCloudUrl, { headers: { Referer: hubCloudUrl } });
+    // Important: Pass the correct Referer
+    const headers = { Referer: hubCloudUrl };
+    
+    // Step 1: Fetch the interstitial page
+    const redirectHtml = await fetchText(hubCloudUrl, { headers });
     if (!redirectHtml) return [];
 
-    const redirectUrlMatch = redirectHtml.match(/var url ?= ?'(.*?)'/);
-    if (!redirectUrlMatch) return [];
+    // Step 2: Extract the destination URL
+    // IMPROVED REGEX: Handles single/double quotes and whitespace variations
+    const redirectUrlMatch = redirectHtml.match(/var\s+url\s*=\s*['"]([^'"]+)['"]/i);
+    
+    if (!redirectUrlMatch) {
+        logWarn(`[4KHDHub] Could not find 'var url' in HubCloud response for ${hubCloudUrl}`);
+        // Fallback: Check for meta refresh just in case
+        const metaRefresh = redirectHtml.match(/content=['"]\d+;url=([^'"]+)['"]/i);
+        if (metaRefresh) {
+            log(`[4KHDHub] Found meta refresh fallback.`);
+             // proceed with metaRefresh[1] if implemented, but usually it's the JS var
+        }
+        return [];
+    }
 
     const finalLinksUrl = redirectUrlMatch[1];
-    const linksHtml = await fetchText(finalLinksUrl, { headers: { Referer: hubCloudUrl } });
+    
+    // Step 3: Fetch the final links page
+    const linksHtml = await fetchText(finalLinksUrl, { headers });
     if (!linksHtml) return [];
 
     const $ = cheerio.load(linksHtml);
     const results = [];
-    const sizeText = $('#size').text();
-    const titleText = $('title').text().trim();
+    const sizeText = $('#size').text(); // Try to get size from final page
+    const titleText = $('title').text().replace(' - HubCloud', '').trim();
 
-    // Combine meta from page with baseMeta (user's code does this)
     const currentMeta = {
         ...baseMeta,
-        bytes: bytes.parse(sizeText) || baseMeta.bytes,
+        bytes: sizeText ? (bytes.parse(sizeText) || baseMeta.bytes) : baseMeta.bytes,
         title: titleText || baseMeta.title
     };
 
-    // FSL Links
-    $('a').each((_i, el) => {
-        const text = $(el).text();
-        const href = $(el).attr('href');
-        if (!href) return;
+    // Helper to clean PixelServer URLs
+    const cleanPixelUrl = (u) => u.replace('/u/', '/api/file/');
 
+    $('a').each((_i, el) => {
+        const text = $(el).text().trim();
+        const href = $(el).attr('href');
+        if (!href || href === '#') return;
+
+        // Condition 1: FSL / Download File
         if (text.includes('FSL') || text.includes('Download File')) {
-            results.push({
+             results.push({
                 source: 'FSL',
                 url: href,
                 meta: currentMeta
             });
         }
-        else if (text.includes('PixelServer')) {
-            const pixelUrl = href.replace('/u/', '/api/file/');
+        // Condition 2: PixelServer / Fast Server
+        else if (text.includes('PixelServer') || text.includes('Fast Server')) {
             results.push({
                 source: 'PixelServer',
-                url: pixelUrl,
+                url: cleanPixelUrl(href),
                 meta: currentMeta
             });
+        }
+        // Condition 3: Instant / Direct (Common variations)
+        else if (text.includes('Instant') || $(el).attr('class')?.includes('btn-success')) {
+             // Sometimes generic success buttons are the download links
+             if (!results.find(r => r.url === href)) {
+                 results.push({
+                    source: 'Direct',
+                    url: href,
+                    meta: currentMeta
+                 });
+             }
         }
     });
 
     if (CACHE_ENABLED && results.length > 0) {
-        await redisCache.saveToCache(cacheKey, { data: results }, '', CACHE_DIR, 3600); // 1 hour TTL
+        await redisCache.saveToCache(cacheKey, { data: results }, '', CACHE_DIR, 3600); // 1 hour
     }
 
     return results;
 }
+
+// --- Main Entry Point ---
 
 async function get4KHDHubStreams(tmdbId, type, season = null, episode = null) {
     const tmdbDetails = await getTmdbDetails(tmdbId, type);
@@ -307,68 +366,93 @@ async function get4KHDHubStreams(tmdbId, type, season = null, episode = null) {
     const isSeries = type === 'series' || type === 'tv';
     const pageUrl = await fetchPageUrl(title, year, isSeries);
     if (!pageUrl) {
-        log(`[4KHDHub] Page not found`);
+        log(`[4KHDHub] Page not found for ${title}`);
         return [];
     }
-    log(`[4KHDHub] Found page: ${pageUrl}`);
-
+    
     const html = await fetchText(pageUrl);
     if (!html) return [];
     const $ = cheerio.load(html);
 
     let itemsToProcess = [];
 
-    if (isSeries && season && episode) { // Use isSeries here
-        // Find specific season and episode
+    if (isSeries && season && episode) {
         const seasonStr = `S${String(season).padStart(2, '0')}`;
         const episodeStr = `Episode-${String(episode).padStart(2, '0')}`;
-
+        
+        // Flexible searching for episode block
         $('.episode-item').each((_i, el) => {
-            if ($('.episode-title', el).text().includes(seasonStr)) {
+            const epTitle = $('.episode-title', el).text();
+            if (epTitle.includes(seasonStr)) {
                 const downloadItems = $('.episode-download-item', el)
-                    .filter((_j, item) => $(item).text().includes(episodeStr));
+                    .filter((_j, item) => {
+                         const txt = $(item).text();
+                         return txt.includes(episodeStr) || txt.includes(`E${String(episode).padStart(2,'0')}`);
+                    });
 
-                downloadItems.each((_k, item) => {
-                    itemsToProcess.push(item);
-                });
+                downloadItems.each((_k, item) => itemsToProcess.push(item));
             }
         });
     } else {
-        // Movies
-        $('.download-item').each((_i, el) => {
-            itemsToProcess.push(el);
-        });
+        $('.download-item').each((_i, el) => itemsToProcess.push(el));
     }
 
-    log(`[4KHDHub] Processing ${itemsToProcess.length} items`);
+    log(`[4KHDHub] Found ${itemsToProcess.length} potential sources. Processing...`);
 
+    // --- CONCURRENCY HANDLING ---
+    // Simple implementation of p-limit to avoid banning
+    // We map the items to promises that execute the extraction logic
+    
     const streams = [];
+    let activePromises = 0;
+    const results = [];
 
-    for (const item of itemsToProcess) {
+    // Helper to process a single item
+    const processItem = async (item) => {
         try {
             const sourceResult = await extractSourceResults($, item);
             if (sourceResult && sourceResult.url) {
-                log(`[4KHDHub] Extracting from HubCloud: ${sourceResult.url}`);
+                log(`[4KHDHub] Extracting ${sourceResult.type}: ${sourceResult.url}`);
                 const extractedLinks = await extractHubCloud(sourceResult.url, sourceResult.meta);
-
-                for (const link of extractedLinks) {
-                    streams.push({
+                
+                extractedLinks.forEach(link => {
+                    results.push({
                         name: `4KHDHub - ${link.source} ${sourceResult.meta.height ? sourceResult.meta.height + 'p' : ''}`,
                         title: `${link.meta.title}\n${bytes.format(link.meta.bytes || 0)}`,
                         url: link.url,
                         quality: sourceResult.meta.height ? `${sourceResult.meta.height}p` : undefined,
                         behaviorHints: {
-                            bingeGroup: `4khdhub-${link.source}`
+                            bingeGroup: `4khdhub-${link.source}`,
+                            // headers: { ... } // If the video file needs headers, add them here
                         }
                     });
-                }
+                });
             }
         } catch (err) {
-            console.error(`[4KHDHub] Item processing error: ${err.message}`);
+            logWarn(`[4KHDHub] Item processing error: ${err.message}`);
         }
-    }
+    };
 
-    return streams;
+    // Execution Queue
+    const queue = [...itemsToProcess];
+    const runQueue = async () => {
+        const workers = [];
+        while (queue.length > 0) {
+            if (workers.length >= CONCURRENCY_LIMIT) {
+                await Promise.race(workers);
+            }
+            const item = queue.shift();
+            const p = processItem(item).then(() => {
+                workers.splice(workers.indexOf(p), 1);
+            });
+            workers.push(p);
+        }
+        await Promise.all(workers);
+    };
+
+    await runQueue();
+
+    return results;
 }
 
 module.exports = { get4KHDHubStreams };
