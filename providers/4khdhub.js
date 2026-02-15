@@ -3,39 +3,37 @@ const cheerio = require('cheerio');
 const bytes = require('bytes');
 const levenshtein = require('fast-levenshtein');
 const rot13Cipher = require('rot13-cipher');
-const { URL } = require('url');
 const path = require('path');
 const fs = require('fs').promises;
 const RedisCache = require('../utils/redisCache');
 
-// Debug logging flag - set DEBUG=true to enable verbose logging
+// Debug logging
 const DEBUG = process.env.DEBUG === 'true' || process.env['4KHDHUB_DEBUG'] === 'true';
 const log = DEBUG ? console.log : () => { };
-const logWarn = DEBUG ? console.warn : () => { };
 
 // Cache configuration
 const CACHE_ENABLED = process.env.DISABLE_CACHE !== 'true';
 const CACHE_DIR = process.env.VERCEL ? path.join('/tmp', '.4khdhub_cache') : path.join(__dirname, '.cache', '4khdhub');
 const redisCache = new RedisCache('4KHDHub');
 
-// Helper to ensure cache directory exists
+const BASE_URL = 'https://4khdhub.dad';
+const TMDB_API_KEY = process.env.TMDB_API_KEY || '439c478a771f35c05022f9feabcca01c';
+
+// Ensure cache directory exists
 const ensureCacheDir = async () => {
     if (!CACHE_ENABLED) return;
     try {
         await fs.mkdir(CACHE_DIR, { recursive: true });
     } catch (error) {
-        console.error(`[4KHDHub] Error creating cache directory: ${error.message}`);
+        if (error.code !== 'EEXIST') console.error(`[4KHDHub] Error creating cache directory: ${error.message}`);
     }
 };
 ensureCacheDir();
 
-const BASE_URL = 'https://4khdhub.dad/';
-const TMDB_API_KEY = '439c478a771f35c05022f9feabcca01c';
-
-// Polyfill for atob if not available globally
+// Helper: Polyfill for atob
 const atob = (str) => Buffer.from(str, 'base64').toString('binary');
 
-// Helper to fetch text content
+// Helper: Fetch Text
 async function fetchText(url, options = {}) {
     try {
         const response = await axios.get(url, {
@@ -47,99 +45,56 @@ async function fetchText(url, options = {}) {
         });
         return response.data;
     } catch (error) {
-        console.error(`[4KHDHub] Request failed for ${url}: ${error.message}`);
+        log(`[4KHDHub] Request failed for ${url}: ${error.message}`);
         return null;
     }
 }
 
-// Fetch TMDB Details
+// 1. Get TMDB Details (Fixed)
 async function getTmdbDetails(tmdbId, type) {
     try {
         const isSeries = type === 'series' || type === 'tv';
         const url = `https://api.themoviedb.org/3/${isSeries ? 'tv' : 'movie'}/${tmdbId}?api_key=${TMDB_API_KEY}`;
-        log(`[4KHDHub] Fetching TMDB details from: ${url}`);
+        
+        const cacheKey = `tmdb_${type}_${tmdbId}`;
+        if (CACHE_ENABLED) {
+            const cached = await redisCache.getFromCache(cacheKey, '', CACHE_DIR);
+            if (cached) return cached.data || cached;
+        }
+
+        log(`[4KHDHub] Fetching TMDB details: ${url}`);
         const response = await axios.get(url);
         const data = response.data;
-        // ...
 
+        let result;
         if (isSeries) {
-            return {
+            result = {
                 title: data.name,
                 year: data.first_air_date ? parseInt(data.first_air_date.split('-')[0]) : 0
             };
         } else {
-            return {
+            result = {
                 title: data.title,
                 year: data.release_date ? parseInt(data.release_date.split('-')[0]) : 0
             };
         }
+
+        if (CACHE_ENABLED) {
+            await redisCache.saveToCache(cacheKey, { data: result }, '', CACHE_DIR, 86400 * 7); // Cache for 7 days
+        }
+        return result;
+
     } catch (error) {
         console.error(`[4KHDHub] TMDB request failed: ${error.message}`);
         return null;
     }
 }
 
-// FourKHDHub Logic
-async function fetchPageUrl(name, year, isSeries) {
-    const cacheKey = `search_v2_${name.replace(/[^a-z0-9]/gi, '_')}_${year}`;
-    // [4KHDHub] Checking cache for key: ${cacheKey} (Enabled: ${CACHE_ENABLED})
-
-    if (CACHE_ENABLED) {
-        const cached = await redisCache.getFromCache(cacheKey, '', CACHE_DIR);
-        if (cached) {
-            // [4KHDHub] Cache HIT for search: ${name}
-            return cached.data || cached;
-        } else {
-            // [4KHDHub] Cache MISS for search: ${name}
-        }
-    }
-
-    const searchUrl = `${BASE_URL}/?s=${encodeURIComponent(`${name} ${year}`)}`;
-    const html = await fetchText(searchUrl);
-    if (!html) return null;
-
-    const $ = cheerio.load(html);
-    const targetType = isSeries ? 'Series' : 'Movies';
-
-    // Find cards that contain the correct type
-    const matchingCards = $('.movie-card')
-        .filter((_i, el) => {
-            const hasFormat = $(el).find(`.movie-card-format:contains("${targetType}")`).length > 0;
-            return hasFormat;
-        })
-        .filter((_i, el) => {
-            const metaText = $(el).find('.movie-card-meta').text();
-            const movieCardYear = parseInt(metaText);
-            return !isNaN(movieCardYear) && Math.abs(movieCardYear - year) <= 1;
-        })
-        .filter((_i, el) => {
-            const movieCardTitle = $(el).find('.movie-card-title')
-                .text()
-                .replace(/\[.*?]/g, '')
-                .trim();
-
-            // Allow exact match or close Levenshtein distance
-            // Also user's code used: useCollator: true, but fast-levenshtein is simpler
-            return levenshtein.get(movieCardTitle.toLowerCase(), name.toLowerCase()) < 5;
-        })
-        .map((_i, el) => {
-            let href = $(el).attr('href');
-            if (href && !href.startsWith('http')) {
-                href = BASE_URL + (href.startsWith('/') ? '' : '/') + href;
-            }
-            return href;
-        })
-        .get();
-
-    const result = matchingCards.length > 0 ? matchingCards[0] : null;
-    if (CACHE_ENABLED && result) {
-        await redisCache.saveToCache(cacheKey, { data: result }, '', CACHE_DIR, 86400); // 1 day TTL
-    }
-    return result;
-}
-
+// 2. Resolve Obfuscated Redirects
 async function resolveRedirectUrl(redirectUrl) {
+    if (!redirectUrl) return null;
     const cacheKey = `redirect_v2_${redirectUrl.replace(/[^a-z0-9]/gi, '')}`;
+    
     if (CACHE_ENABLED) {
         const cached = await redisCache.getFromCache(cacheKey, '', CACHE_DIR);
         if (cached) return cached.data || cached;
@@ -152,17 +107,16 @@ async function resolveRedirectUrl(redirectUrl) {
         const redirectDataMatch = redirectHtml.match(/'o','(.*?)'/);
         if (!redirectDataMatch) return null;
 
-        // JSON.parse(atob(rot13Cipher(atob(atob(redirectDataMatch[1] as string)))))
         const step1 = atob(redirectDataMatch[1]);
         const step2 = atob(step1);
-        const step3 = rot13Cipher(step2);
+        const step3 = rot13Cipher(step2); // Requires rot13-cipher package
         const step4 = atob(step3);
         const redirectData = JSON.parse(step4);
 
         if (redirectData && redirectData.o) {
             const resolved = atob(redirectData.o);
             if (CACHE_ENABLED) {
-                await redisCache.saveToCache(cacheKey, { data: resolved }, '', CACHE_DIR, 86400 * 3); // 3 days
+                await redisCache.saveToCache(cacheKey, { data: resolved }, '', CACHE_DIR, 86400 * 3);
             }
             return resolved;
         }
@@ -172,22 +126,76 @@ async function resolveRedirectUrl(redirectUrl) {
     return null;
 }
 
+// 3. Search for the Page URL
+async function fetchPageUrl(name, year, isSeries) {
+    const cacheKey = `search_v3_${name.replace(/[^a-z0-9]/gi, '_')}_${year}_${isSeries}`;
+    
+    if (CACHE_ENABLED) {
+        const cached = await redisCache.getFromCache(cacheKey, '', CACHE_DIR);
+        if (cached) return cached.data || cached;
+    }
+
+    const searchUrl = `${BASE_URL}/?s=${encodeURIComponent(`${name} ${year}`)}`;
+    const html = await fetchText(searchUrl);
+    if (!html) return null;
+
+    const $ = cheerio.load(html);
+    const targetType = isSeries ? 'Series' : 'Movies';
+
+    const matchingCards = $('.movie-card')
+        .filter((_i, el) => {
+            // Check type (Series vs Movie) if possible, but 4KHDHub often mixes them.
+            // We rely heavily on Title + Year matching.
+            return true; 
+        })
+        .filter((_i, el) => {
+            const metaText = $(el).find('.movie-card-meta').text();
+            const movieCardYear = parseInt(metaText) || 0;
+            // Allow 1 year variance
+            return Math.abs(movieCardYear - year) <= 1;
+        })
+        .filter((_i, el) => {
+            const movieCardTitle = $(el).find('.movie-card-title').text()
+                .replace(/\[.*?]/g, '') // Remove [4K] [Dual Audio] etc
+                .trim();
+            
+            const dist = levenshtein.get(movieCardTitle.toLowerCase(), name.toLowerCase());
+            return dist < 5 || movieCardTitle.toLowerCase().includes(name.toLowerCase());
+        })
+        .map((_i, el) => {
+            let href = $(el).find('a').first().attr('href'); // Ensure we grab the anchor tag href
+            if (href && !href.startsWith('http')) {
+                href = BASE_URL + (href.startsWith('/') ? '' : '/') + href;
+            }
+            return href;
+        })
+        .get();
+
+    const result = matchingCards.length > 0 ? matchingCards[0] : null;
+    
+    if (CACHE_ENABLED && result) {
+        await redisCache.saveToCache(cacheKey, { data: result }, '', CACHE_DIR, 86400);
+    }
+    return result;
+}
+
+// 4. Extract Intermediate Links (HubCloud/HubDrive)
 async function extractSourceResults($, el) {
     const localHtml = $(el).html();
-    const sizeMatch = localHtml.match(/([\d.]+ ?[GM]B)/);
-    let heightMatch = localHtml.match(/\d{3,}p/);
+    const sizeMatch = localHtml.match(/([\d.]+ ?[GM]B)/i);
+    let heightMatch = localHtml.match(/(\d{3,4})p/i);
 
-    const title = $(el).find('.file-title, .episode-file-title').text().trim();
+    const title = $(el).find('.file-title, .episode-file-title, strong').text().trim();
 
-    // If quality detection failed from HTML, try the title
+    // Fallback quality detection
     if (!heightMatch) {
         heightMatch = title.match(/(\d{3,4})p/i);
     }
-
-    // Fallback for "4K"
-    let height = heightMatch ? parseInt(heightMatch[0]) : 0;
-    if (height === 0 && (title.includes('4K') || title.includes('4k') || localHtml.includes('4K') || localHtml.includes('4k'))) {
+    let height = heightMatch ? parseInt(heightMatch[1]) : 0;
+    if (height === 0 && (title.includes('4K') || title.includes('2160p'))) {
         height = 2160;
+    } else if (height === 0 && (title.includes('1080p'))) {
+        height = 1080;
     }
 
     const meta = {
@@ -196,175 +204,196 @@ async function extractSourceResults($, el) {
         title: title
     };
 
-    // Check for HubCloud link
-    let hubCloudLink = $(el).find('a')
-        .filter((_i, a) => $(a).text().includes('HubCloud'))
-        .attr('href');
-
-    if (hubCloudLink) {
-        const resolved = await resolveRedirectUrl(hubCloudLink);
-        return { url: resolved, meta };
+    // Find HubCloud Link
+    let hubCloudLink = $(el).find('a[href*="hubcloud"], a[href*="/archives/"]').first().attr('href');
+    
+    // Sometimes links are hidden in buttons
+    if (!hubCloudLink) {
+        $(el).find('a').each((i, a) => {
+            const txt = $(a).text().toLowerCase();
+            if (txt.includes('hubcloud') || txt.includes('watch') || txt.includes('download')) {
+                hubCloudLink = $(a).attr('href');
+                return false; // break
+            }
+        });
     }
 
-    // Check for HubDrive link
-    let hubDriveLink = $(el).find('a')
-        .filter((_i, a) => $(a).text().includes('HubDrive'))
-        .attr('href');
-
-    if (hubDriveLink) {
-        const resolvedDrive = await resolveRedirectUrl(hubDriveLink);
-        if (resolvedDrive) {
-            const hubDriveHtml = await fetchText(resolvedDrive);
-            if (hubDriveHtml) {
-                const $2 = cheerio.load(hubDriveHtml);
-                const innerCloudLink = $2('a:contains("HubCloud")').attr('href');
-                if (innerCloudLink) {
-                    return { url: innerCloudLink, meta };
-                }
-            }
+    if (hubCloudLink) {
+        // Resolve the first redirect
+        const resolved = await resolveRedirectUrl(hubCloudLink);
+        if (resolved) {
+             return { url: resolved, meta };
         }
     }
 
     return null;
 }
 
-// HubCloud Extractor Logic
+// 5. Extract Final Streaming Links (FSL/Pixel)
 async function extractHubCloud(hubCloudUrl, baseMeta) {
     if (!hubCloudUrl) return [];
 
-    const cacheKey = `hubcloud_v2_${hubCloudUrl.replace(/[^a-z0-9]/gi, '')}`;
+    const cacheKey = `hubcloud_final_${hubCloudUrl.replace(/[^a-z0-9]/gi, '')}`;
     if (CACHE_ENABLED) {
         const cached = await redisCache.getFromCache(cacheKey, '', CACHE_DIR);
         if (cached) return cached.data || cached;
     }
 
-    const headers = { Referer: hubCloudUrl }; // or should it be the previous page? User's code uses meta.referer ?? url.href. HubCloud.ts says Referer: meta.referer ?? url.href.
-    // In extractInternal(ctx, url, meta): const headers = { Referer: meta.referer ?? url.href };
-    // Then fetches redirectHtml.
-
-    // We'll trust the url itself as referer if we don't have the parent page readily passed down, or just no referer.
-    // Let's use the HubCloud URL itself as referer for the first request, that's usually safe or standard.
-
+    // 1. Fetch the HubCloud page (often has a JS redirect)
     const redirectHtml = await fetchText(hubCloudUrl, { headers: { Referer: hubCloudUrl } });
     if (!redirectHtml) return [];
 
+    // 2. Look for the "var url = '...'" pattern used by their verification
     const redirectUrlMatch = redirectHtml.match(/var url ?= ?'(.*?)'/);
     if (!redirectUrlMatch) return [];
 
     const finalLinksUrl = redirectUrlMatch[1];
+    
+    // 3. Fetch the actual links page
     const linksHtml = await fetchText(finalLinksUrl, { headers: { Referer: hubCloudUrl } });
     if (!linksHtml) return [];
 
     const $ = cheerio.load(linksHtml);
     const results = [];
-    const sizeText = $('#size').text();
-    const titleText = $('title').text().trim();
-
-    // Combine meta from page with baseMeta (user's code does this)
+    
+    // Try to grab size/title from this final page if missing
+    const pageTitle = $('.card-title').text() || $('h4').text();
+    const pageSize = $('.file-size').text(); 
+    
     const currentMeta = {
         ...baseMeta,
-        bytes: bytes.parse(sizeText) || baseMeta.bytes,
-        title: titleText || baseMeta.title
+        title: baseMeta.title || pageTitle,
+        bytes: baseMeta.bytes || (pageSize ? bytes.parse(pageSize) : 0)
     };
 
-    // FSL Links
-    $('a').each((_i, el) => {
-        const text = $(el).text();
+    $('.btn, a').each((_i, el) => {
+        const text = $(el).text().trim();
         const href = $(el).attr('href');
-        if (!href) return;
+        if (!href || href === '#') return;
 
-        if (text.includes('FSL') || text.includes('Download File')) {
+        if (text.includes('FSL') || text.includes('Fast Server') || text.includes('Download File')) {
             results.push({
                 source: 'FSL',
                 url: href,
                 meta: currentMeta
             });
         }
-        else if (text.includes('PixelServer')) {
-            const pixelUrl = href.replace('/u/', '/api/file/');
+        else if (text.includes('Pixel') || href.includes('pixeldra')) {
+            // Convert /u/ to /api/file/ for direct streaming if possible
+            // const pixelUrl = href.replace('/u/', '/api/file/'); 
             results.push({
-                source: 'PixelServer',
-                url: pixelUrl,
+                source: 'PixelDrain',
+                url: href,
                 meta: currentMeta
             });
         }
     });
 
     if (CACHE_ENABLED && results.length > 0) {
-        await redisCache.saveToCache(cacheKey, { data: results }, '', CACHE_DIR, 3600); // 1 hour TTL
+        await redisCache.saveToCache(cacheKey, { data: results }, '', CACHE_DIR, 3600);
     }
 
     return results;
 }
 
+// === MAIN FUNCTION ===
 async function get4KHDHubStreams(tmdbId, type, season = null, episode = null) {
-    const tmdbDetails = await getTmdbDetails(tmdbId, type);
-    if (!tmdbDetails) return [];
-
-    const { title, year } = tmdbDetails;
-    log(`[4KHDHub] Search: ${title} (${year})`);
-
     const isSeries = type === 'series' || type === 'tv';
-    const pageUrl = await fetchPageUrl(title, year, isSeries);
-    if (!pageUrl) {
-        log(`[4KHDHub] Page not found`);
+    
+    // 1. Get Metadata
+    const tmdbDetails = await getTmdbDetails(tmdbId, type);
+    if (!tmdbDetails) {
+        log(`[4KHDHub] No TMDB details found for ID ${tmdbId}`);
         return [];
     }
-    log(`[4KHDHub] Found page: ${pageUrl}`);
 
+    const { title, year } = tmdbDetails;
+    log(`[4KHDHub] Processing: ${title} (${year})`);
+
+    // 2. Find Page URL
+    const pageUrl = await fetchPageUrl(title, year, isSeries);
+    if (!pageUrl) {
+        log(`[4KHDHub] Page not found for ${title}`);
+        return [];
+    }
+
+    // 3. Parse Page
     const html = await fetchText(pageUrl);
     if (!html) return [];
     const $ = cheerio.load(html);
 
     let itemsToProcess = [];
 
-    if (isSeries && season && episode) { // Use isSeries here
-        // Find specific season and episode
+    if (isSeries && season && episode) {
+        // Series Logic
         const seasonStr = `S${String(season).padStart(2, '0')}`;
-        const episodeStr = `Episode-${String(episode).padStart(2, '0')}`;
+        const episodeStr = `E${String(episode).padStart(2, '0')}`; // Standard S01E01
+        
+        // Also try "Episode 1" format
+        const episodeStrAlt = `Episode-${String(episode).padStart(2, '0')}`;
+        const episodeStrAlt2 = `Episode ${episode}`;
 
-        $('.episode-item').each((_i, el) => {
-            if ($('.episode-title', el).text().includes(seasonStr)) {
-                const downloadItems = $('.episode-download-item', el)
-                    .filter((_j, item) => $(item).text().includes(episodeStr));
-
-                downloadItems.each((_k, item) => {
-                    itemsToProcess.push(item);
+        // Find the Season Container first
+        $('h3, h4, .episode-category').each((i, el) => {
+            if ($(el).text().includes(seasonStr) || $(el).text().includes(`Season ${season}`)) {
+                // Look for episodes nearby
+                $(el).nextUntil('h3').find('a').each((j, link) => {
+                    const txt = $(link).text();
+                    if (txt.includes(episodeStr) || txt.includes(episodeStrAlt) || txt.includes(episodeStrAlt2)) {
+                         // This anchor tag probably leads to the episode page or is a direct download link
+                         itemsToProcess.push(link);
+                    }
                 });
             }
         });
+
+        // Fallback: Check if page structure is "One page per season"
+        if (itemsToProcess.length === 0) {
+             $('p, div').filter((i, el) => $(el).text().includes(seasonStr)).find('a').each((i, link) => {
+                  const txt = $(link).text();
+                  if (txt.includes(episodeStr) || txt.includes(episodeStrAlt)) {
+                      itemsToProcess.push(link);
+                  }
+             });
+        }
+
     } else {
-        // Movies
-        $('.download-item').each((_i, el) => {
-            itemsToProcess.push(el);
+        // Movie Logic: Grab all download links usually found in "Download Links" section
+        $('.download-links a, p a').each((_i, el) => {
+             const txt = $(el).text();
+             if (txt.includes('Download') || txt.includes('Watch') || txt.includes('HubCloud')) {
+                 itemsToProcess.push(el);
+             }
         });
     }
 
-    log(`[4KHDHub] Processing ${itemsToProcess.length} items`);
+    log(`[4KHDHub] Found ${itemsToProcess.length} potential links`);
 
     const streams = [];
 
+    // 4. Extract Streams
     for (const item of itemsToProcess) {
         try {
+            // Get HubCloud URL from the item
             const sourceResult = await extractSourceResults($, item);
+            
             if (sourceResult && sourceResult.url) {
-                log(`[4KHDHub] Extracting from HubCloud: ${sourceResult.url}`);
+                log(`[4KHDHub] Resolving HubCloud: ${sourceResult.url}`);
                 const extractedLinks = await extractHubCloud(sourceResult.url, sourceResult.meta);
 
                 for (const link of extractedLinks) {
                     streams.push({
-                        name: `4KHDHub - ${link.source} ${sourceResult.meta.height ? sourceResult.meta.height + 'p' : ''}`,
-                        title: `${link.meta.title}\n${bytes.format(link.meta.bytes || 0)}`,
+                        name: `4KHDHub\n${link.source} ${sourceResult.meta.height ? sourceResult.meta.height + 'p' : ''}`,
+                        title: `${title}\n${link.meta.title}\n💾 ${bytes.format(link.meta.bytes || 0)}`,
                         url: link.url,
-                        quality: sourceResult.meta.height ? `${sourceResult.meta.height}p` : undefined,
                         behaviorHints: {
-                            bingeGroup: `4khdhub-${link.source}`
+                            bingeGroup: `4khdhub-${link.source}-${sourceResult.meta.height||'unk'}`
                         }
                     });
                 }
             }
         } catch (err) {
-            console.error(`[4KHDHub] Item processing error: ${err.message}`);
+            if (DEBUG) console.error(`[4KHDHub] Item error: ${err.message}`);
         }
     }
 
