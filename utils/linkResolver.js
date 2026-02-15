@@ -369,9 +369,3 @@ module.exports = {
   extractFinalDownloadFromFilePage,
   resolveSidToRedirect
 };
-
-
-
-
-
-
